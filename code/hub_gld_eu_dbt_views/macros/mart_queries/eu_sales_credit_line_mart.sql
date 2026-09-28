@@ -1,4 +1,4 @@
-{% macro mart_query() %}
+{% macro eu_sales_credit_line_mart() %}
 WITH
 -- 01. Credit invoice lines — negative-amount credit lines (line_ext_amt < 0), itm_id/invn_trans_id required
 credit_invoice_line AS (
@@ -95,48 +95,7 @@ org_emple_hr_mstr AS (
     ) = 1
 ),
 
--- 05. Document reference notes — distinct note text per order line, latest occurrence retained
-doc_ref_note AS (
-    SELECT
-        -- Reference keys
-        ref_lgl_enty_cd,
-        ref_rec_id,
-        -- Note
-        NULLIF(TRIM(doc_note_txt), '')                  AS doc_note_txt,
-        -- Recency of this note text
-        MAX(src_doc_ref_mod_dttm)                       AS src_doc_ref_mod_dttm,
-        MAX(src_doc_ref_rec_id)                         AS src_doc_ref_rec_id
-    FROM `syy-df-hub-gld-eu-q.shared_d365_fo_eu_curr_dmnsl.ref_doc_ref_eu_val`
-    WHERE src_doc_ref_del_ind <> 'Y'
-
-    GROUP BY
-        ref_lgl_enty_cd,
-        ref_rec_id,
-        NULLIF(TRIM(doc_note_txt), '')
-),
-
--- 06. Document reference — notes concatenated newest first, one row per order line, prevents fan-out
-doc_ref AS (
-    SELECT
-        -- Reference keys
-        ref_lgl_enty_cd,
-        ref_rec_id,
-        -- Concatenated notes
-        STRING_AGG(
-        doc_note_txt,
-        ' | '
-        ORDER BY src_doc_ref_mod_dttm DESC, src_doc_ref_rec_id DESC
-        )                                               AS doc_note_txt,
-        -- Record id — latest reference retained for traceability
-        MAX(src_doc_ref_rec_id)                         AS src_doc_ref_rec_id
-    FROM doc_ref_note
-
-    GROUP BY
-        ref_lgl_enty_cd,
-        ref_rec_id
-),
-
--- 07. Credit report base — self-joins to original order line, nets rebate, enriches attributes
+-- 05. Credit report base — self-joins to original order line, nets rebate, enriches attributes
 credit_base AS (
     SELECT
       -- Business keys
@@ -159,7 +118,17 @@ credit_base AS (
         slc.sale_ordr_nbr                               AS telesales_ordr_no,
         slo.sale_ordr_nbr                               AS crdt_line_lnk_to_sale_ordr_nbr,
         slc.prc_comnt_txt                               AS crdt_intrl_comnt_txt,
-        doc.doc_note_txt                                AS crdt_uplift_comnt_txt,
+      -- Uplift comment — source-specific gate mirroring the legacy report
+        IF(
+        (sl.src_sys_cd = 'AX'
+            AND (soh.ordr_ent_typ_cd = 8
+                OR (soh.ordr_ent_typ_cd = 9
+                    AND COALESCE(sl.rtn_rsn_cd, '') <> '')))
+        OR (sl.src_sys_cd = 'D365'
+            AND soh.ordr_sts_cd = 4),
+        doc.doc_note_txt,
+        NULL
+        )                                               AS crdt_uplift_comnt_txt,
         doc.src_doc_ref_rec_id                          AS doc_ref_rec_id,
       -- Customer, item and return attributes
         sl.rtn_rsn_cd,
@@ -192,9 +161,11 @@ credit_base AS (
         AND slc.lgl_enty_cd       = slo.lgl_enty_cd
         AND slo.src_sale_line_del_ind <> 'Y'
 
-    LEFT JOIN doc_ref doc
-        ON  slc.src_sale_line_rec_id = doc.ref_rec_id
+    -- document reference — joined on src_doc_ref_rec_id per Silver team guidance
+    LEFT JOIN `syy-df-hub-gld-eu-q.shared_d365_fo_eu_curr_dmnsl.ref_doc_ref_eu_val` doc
+        ON  slc.src_sale_line_rec_id = doc.src_doc_ref_rec_id
         AND sl.lgl_enty_cd           = doc.ref_lgl_enty_cd
+        AND doc.src_doc_ref_del_ind <> 'Y'
 
     LEFT JOIN `syy-df-hub-gld-eu-q.shared_d365_fo_eu_curr_dmnsl.sale_ordr_head_eu_fact` soh
         ON  sl.sale_ordr_nbr = soh.sale_ordr_nbr
@@ -239,7 +210,7 @@ credit_base AS (
         AND srr.src_rtn_rsn_cd_del_ind <> 'Y'
 ),
 
--- 08. Fiscal calendar — resolves crdt_invc_req_ship_dt into fiscal year/week
+-- 06. Fiscal calendar — resolves crdt_invc_req_ship_dt into fiscal year/week
 fiscal_calendar AS (
     SELECT
         fisc_prd_typ_cd,
@@ -340,5 +311,5 @@ FROM credit_base cb
 LEFT JOIN fiscal_calendar fisc
     ON fisc.fisc_prd_typ_cd = 1
     WHERE cb.crdt_invc_req_ship_dt BETWEEN fisc.wk_strt_dt AND fisc.wk_end_dt
-    
+
 {% endmacro %}

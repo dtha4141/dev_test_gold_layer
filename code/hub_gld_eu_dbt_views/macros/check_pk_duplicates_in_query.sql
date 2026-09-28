@@ -1,69 +1,69 @@
-{% macro check_pk_duplicates_in_query(pk_columns, row_limit=50) %}
+{% macro check_pk_duplicates_in_query(mart_name, row_limit=50, all_columns=false) %}
 
-{% set base_query %}{{ mart_query() }}{% endset %}
+{% set pk_cols = get_mart_config(mart_name)['duplicate_keys'] %}
+{% set base_query %}{{ get_mart_query(mart_name) }}{% endset %}
+{% set key_list = pk_cols | join(", ") %}
 
-{% set count_sql %}
+{% set dup_sql %}
 with base_mart as (
     {{ base_query }}
 ),
 pk_groups as (
     select
-        {% for col in pk_columns %}
-        {{ col }}{{ "," if not loop.last }}
-        {% endfor %}
-        , count(*) as row_count
+        {{ key_list }},
+        count(*) as row_count
     from base_mart
-    group by
-        {% for col in pk_columns %}
-        {{ col }}{{ "," if not loop.last }}
-        {% endfor %}
+    group by {{ key_list }}
     having count(*) > 1
 )
-select count(*) as duplicate_key_count
+select
+    *,
+    count(*) over () as total_dup_keys
 from pk_groups
+order by row_count desc
+limit {{ row_limit }}
 {% endset %}
 
 {% if execute %}
-    {% set results = run_query(count_sql) %}
-    {% set dup_count = results.rows[0]['duplicate_key_count'] %}
+    {% set dups = run_query(dup_sql) %}
 
-    {% if dup_count == 0 %}
-        {{ log("No duplicate primary key values found.", info=True) }}
+    {{ log("", info=True) }}
+    {{ log("PRIMARY KEY DUPLICATE CHECK: " ~ mart_name, info=True) }}
+    {{ log("Key columns: " ~ key_list, info=True) }}
+
+    {% if dups.rows | length == 0 %}
+        {{ log("RESULT: PASS - no duplicate primary key values.", info=True) }}
     {% else %}
-        {{ log("[FAIL] " ~ dup_count ~ " duplicate primary key combination(s) found.", info=True) }}
+        {{ log("RESULT: FAIL - " ~ dups.rows[0]['total_dup_keys'] ~ " duplicated key combination(s). Showing up to " ~ row_limit ~ ":", info=True) }}
+        {% do dups.exclude(['total_dup_keys']).print_table(max_rows=none, max_columns=none, max_column_width=40) %}
 
-        {% set sample_sql %}
-        with base_mart as (
-            {{ base_query }}
-        ),
-        pk_groups as (
-            select
-                {% for col in pk_columns %}
-                {{ col }}{{ "," if not loop.last }}
+        {% if all_columns %}
+            {% set full_sql %}
+            with base_mart as (
+                {{ base_query }}
+            ),
+            pk_groups as (
+                select {{ key_list }}, count(*) as row_count
+                from base_mart
+                group by {{ key_list }}
+                having count(*) > 1
+                order by row_count desc
+                limit {{ row_limit }}
+            )
+            select bm.*
+            from base_mart bm
+            inner join pk_groups dg
+                on
+                {% for col in pk_cols %}
+                bm.{{ col }} = dg.{{ col }}{{ " and " if not loop.last }}
                 {% endfor %}
-                , count(*) as row_count
-            from base_mart
-            group by
-                {% for col in pk_columns %}
-                {{ col }}{{ "," if not loop.last }}
-                {% endfor %}
-            having count(*) > 1
-        )
-        select bm.*
-        from base_mart bm
-        inner join pk_groups dg
-            on
-            {% for col in pk_columns %}
-            bm.{{ col }} = dg.{{ col }}{{ " and " if not loop.last }}
-            {% endfor %}
-        limit {{ row_limit }}
-        {% endset %}
-
-        {% set sample_results = run_query(sample_sql) %}
-        {{ log("---- Sample rows sharing a duplicated primary key ----", info=True) }}
-        {% for r in sample_results.rows %}
-            {{ log(r.values() | join(" | "), info=True) }}
-        {% endfor %}
+            order by {{ key_list }}
+            {% endset %}
+            {% set full_rows = run_query(full_sql) %}
+            {{ log("", info=True) }}
+            {{ log("Full rows for the duplicated keys above:", info=True) }}
+            {% do full_rows.print_table(max_rows=none, max_columns=none, max_column_width=40) %}
+        {% endif %}
     {% endif %}
 {% endif %}
 
